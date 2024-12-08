@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flight Route Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f0f0f0;
+        }
+
+        #map {
+            height: 70vh;
+            width: 100%;
+            border: 1px solid #ccc;
+        }
+
+        #info {
+            margin: 10px;
+            font-family: Arial, sans-serif;
+            padding: 10px;
+            background-color: rgba(255, 255, 255, 0.9);
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        #controls {
+            margin: 10px;
+            text-align: center;
+        }
+
+        input {
+            padding: 10px;
+            margin-right: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            width: 200px;
+        }
+
+        button {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 5px;
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.2s;
+        }
+
+        button:hover {
+            background-color: #0056b3;
+            transform: scale(1.05);
+        }
+
+        .custom-marker {
+            background-color: #ff5733;
+            border-radius: 50%;
+            width: 12px;
+            height: 12px;
+            position: absolute;
+            transform: translate(-50%, -50%);
+        }
+
+        .path-info {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-left: 4px solid #007bff;
+            background-color: #e7f0ff;
+        }
+
+        .airplane {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background-image: url('https://cdn-icons-png.flaticon.com/512/130/130964.png');
+            background-size: cover;
+            transform: translate(-50%, -50%);
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="controls">
+        <input type="text" id="source" placeholder="Enter source airport name" />
+        <input type="text" id="destination" placeholder="Enter destination airport name" />
+        <input type="number" id="numStops" placeholder="Max number of stops" min="1" />
+        <button id="findRoutesBtn">Find Top Routes</button>
+        <button id="playBtn">Play Visualization</button>
+        <button id="stopBtn" disabled>Stop Visualization</button>
+    </div>
+
+    <div id="map"></div>
+    <div id="info"></div>
+    <div class="airplane" id="airplane"></div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([20.5937, 78.9629], 5);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        let airports = {};
+        let graph = {};
+
+        const smallIcon = L.icon({
+            iconUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png', // Default Leaflet icon
+            iconSize: [20, 32], // Original is [25, 41]; adjust as needed
+            iconAnchor: [10, 32], // Adjust to ensure the marker points correctly
+            popupAnchor: [1, -32] // Position of popup relative to the marker
+        });
+
+        // Fetching airport data
+        fetch('airports_distance_matrix.json')
+            .then(response => response.json())
+            .then(data => {
+                data.forEach(airport => {
+                    if (airport.latitude && airport.longitude) {
+                        // Use smaller custom marker icon
+                        L.marker([airport.latitude, airport.longitude], { icon: smallIcon }).addTo(map)
+                            .bindPopup(`<b>${airport.name}</b><br>${airport.city} (${airport.iata})`);
+
+                        //storing airport data
+                        airports[airport.name] = {
+                            lat: airport.latitude,
+                            lon: airport.longitude,
+                            iata: airport.iata
+                        };
+                        //storing graph
+                        graph[airport.name] = {};
+                        airport.distances.forEach(distance => {
+                            if (distance.name && distance.distance) {
+                                graph[airport.name][distance.name] = distance.distance;
+                            }
+                        });
+                    }
+                });
+            })
+            .catch(error => console.log('Error loading airport data:', error));
+
+        let pathLayers = [];
+        let currentPathIndex = 0;
+        let currentPathInterval, currentMoveInterval;
+
+        // Custom Priority Queue Implementation
+        class MinPriorityQueue {
+            constructor() {
+                this.heap = [];
+            }
+
+            enqueue(item) {
+                this.heap.push(item);
+                this.bubbleUp();
+            }
+
+            dequeue() {
+                const min = this.heap[0];
+                const end = this.heap.pop();
+                if (this.heap.length > 0) {
+                    this.heap[0] = end;
+                    this.bubbleDown();
+                }
+                return min;
+            }
+
+            isEmpty() {
+                return this.heap.length === 0;
+            }
+
+            bubbleUp() {
+                let index = this.heap.length - 1;
+                const element = this.heap[index];
+
+                while (index > 0) {
+                    let parentIndex = Math.floor((index - 1) / 2);
+                    let parent = this.heap[parentIndex];
+
+                    if (element.distance >= parent.distance) break;
+
+                    this.heap[index] = parent;
+                    this.heap[parentIndex] = element;
+                    index = parentIndex;
+                }
+            }
+
+            bubbleDown() {
+                let index = 0;
+                const length = this.heap.length;
+                const element = this.heap[0];
+
+                while (true) {
+                    let leftChildIndex = 2 * index + 1;
+                    let rightChildIndex = 2 * index + 2;
+                    let leftChild, rightChild;
+                    let swap = null;
+
+                    if (leftChildIndex < length) {
+                        leftChild = this.heap[leftChildIndex];
+                        if (leftChild.distance < element.distance) {
+                            swap = leftChildIndex;
+                        }
+                    }
+
+                    if (rightChildIndex < length) {
+                        rightChild = this.heap[rightChildIndex];
+                        if (
+                            (swap === null && rightChild.distance < element.distance) ||
+                            (swap !== null && rightChild.distance < leftChild.distance)
+                        ) {
+                            swap = rightChildIndex;
+                        }
+                    }
+
+                    if (swap === null) break;
+                    this.heap[index] = this.heap[swap];
+                    this.heap[swap] = element;
+                    index = swap;
+                }
+            }
+        }
+
+        document.getElementById('findRoutesBtn').addEventListener('click', () => {
+            const source = document.getElementById('source').value;
+            const destination = document.getElementById('destination').value;
+            const numStops = parseInt(document.getElementById('numStops').value, 10);
+
+            if (airports[source] && airports[destination]) {
+                findTopThreePaths(source, destination, numStops);
+            } else {
+                alert("Invalid airport name(s). Please enter valid names.");
+            }
+        });
+
+        document.getElementById('playBtn').addEventListener('click', () => {
+            const source = document.getElementById('source').value;
+            const destination = document.getElementById('destination').value;
+            const numStops = parseInt(document.getElementById('numStops').value, 10);
+
+            if (pathLayers.length > 0) {
+                alert("Visualization is already in progress. Please stop it first.");
+                return;
+            }
+
+            if (airports[source] && airports[destination]) {
+                const paths = dijkstra(graph, source, destination, numStops);
+                displayPaths(paths, source, destination);
+                visualizePaths(paths);
+                document.getElementById('stopBtn').disabled = false;
+            } else {
+                alert("Invalid airport name(s). Please enter valid names.");
+            }
+        });
+
+        document.getElementById('stopBtn').addEventListener('click', () => {
+            stopVisualization();
+        });
+
+        function visualizePaths(paths) {
+            if (paths.length === 0) return;
+
+            currentPathIndex = 0;
+            const airplane = document.getElementById('airplane');
+            airplane.style.display = 'block';
+
+            currentPathInterval = setInterval(() => {
+                if (currentPathIndex >= paths.length) {
+                    clearInterval(currentPathInterval);
+                    airplane.style.display = 'none';
+                    return;
+                }
+
+                const { path } = paths[currentPathIndex];
+                const routeCoords = path.map(airport => [airports[airport].lat, airports[airport].lon]);
+                const polyline = L.polyline(routeCoords, { color: getRandomColor(), weight: 4, opacity: 0.7 }).addTo(map);
+                pathLayers.push(polyline);
+
+                moveAirplane(routeCoords);
+
+                currentPathIndex++;
+            }, 3000);
+        }
+
+        function moveAirplane(routeCoords) {
+            const airplane = document.getElementById('airplane');
+            let currentIndex = 0;
+
+            currentMoveInterval = setInterval(() => {
+                if (currentIndex >= routeCoords.length) {
+                    clearInterval(currentMoveInterval);
+                    return;
+                }
+
+                const [lat, lon] = routeCoords[currentIndex];
+                airplane.style.left = map.latLngToLayerPoint([lat, lon]).x + 'px';
+                airplane.style.top = map.latLngToLayerPoint([lat, lon]).y + 'px';
+                currentIndex++;
+            }, 1000);
+        }
+
+        function stopVisualization() {
+            pathLayers.forEach(layer => map.removeLayer(layer));
+            pathLayers = [];
+            clearInterval(currentPathInterval);
+            clearInterval(currentMoveInterval);
+            currentPathIndex = 0;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('airplane').style.display = 'none';
+        }
+
+        function findTopThreePaths(source, destination, maxStops) {
+            const paths = dijkstra(graph, source, destination, maxStops);
+            displayPaths(paths, source, destination);
+        }
+
+        function displayPaths(paths, source, destination) {
+            const infoDiv = document.getElementById('info');
+            infoDiv.innerHTML = '';
+
+            if (paths.length === 0) {
+                infoDiv.innerHTML = `<p>No paths found from ${source} to ${destination} with the specified number of stops.</p>`;
+                return;
+            }
+
+            paths.forEach((pathObj, index) => {
+                const { path, distance } = pathObj;
+                const color = getRandomColor();  // Generate a random color for the path
+
+                // Create the path info element with the color box
+                const pathInfo = document.createElement('div');
+                pathInfo.classList.add('path-info');
+                pathInfo.innerHTML = `
+            <div style="display: flex; align-items: center;">
+                <div style="width: 20px; height: 20px; background-color: ${color}; margin-right: 10px; border: 1px solid #000;"></div>
+                <span><b>Path ${index + 1}:</b> ${path.join(' → ')} (Total Distance: ${distance.toFixed(2)} km)</span>
+            </div>
+        `;
+
+                infoDiv.appendChild(pathInfo);
+            });
+        }
+
+        // Optimized Dijkstra with Min-Priority Queue
+        function dijkstra(graph, start, goal, maxStops) {
+            const allPaths = [];
+            const queue = new MinPriorityQueue();
+
+            // Initialize the queue with the start node
+            queue.enqueue({ node: start, stops: 0, path: [start], distance: 0 });
+
+            while (!queue.isEmpty()) {
+                const { node, stops, path, distance } = queue.dequeue();
+
+                // If we reach the goal with exactly maxStops, save the path
+                if (stops === maxStops && node === goal) {
+                    allPaths.push({ path: [...path], distance });
+
+                    // Stop early if we already found enough paths (3 or 5)
+                    if (allPaths.length === 5) {
+                        break;
+                    }
+                    continue;
+                }
+
+                // If still within stop limits, continue to explore neighbors
+                if (stops < maxStops) {
+                    Object.keys(graph[node]).forEach(neighbor => {
+                        if (!path.includes(neighbor) && neighbor !== start) {
+                            const newDistance = distance + graph[node][neighbor];
+                            queue.enqueue({
+                                node: neighbor,
+                                stops: stops + 1,
+                                path: [...path, neighbor],
+                                distance: newDistance
+                            });
+                        }
+                    });
+                }
+            }
+
+            // Sort the paths by distance and return the top 3 (or 5)
+            allPaths.sort((a, b) => a.distance - b.distance);
+            return allPaths.slice(0, 5);  // Change this to 5 if you want top 5
+        }
+
+        function getRandomColor() {
+            const letters = '0123456789ABCDEF';
+            let color = '#';
+            for (let i = 0; i < 6; i++) {
+                color += letters[Math.floor(Math.random() * 16)];
+            }
+            return color;
+        }
+    </script>
+</body>
+
+</html>
